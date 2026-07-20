@@ -1,3 +1,4 @@
+# from chrischoy.org/posts/cutedsl-basics
 import cutlass
 from cutlass import cute
 
@@ -153,13 +154,19 @@ def vadd(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor):
     )
 
 
-@cute.kernel
-def vadd_kernel_zipped(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
-    thread_idx, _, _ = cute.arch.thread_idx()
-    block_idx, _, _ = cute.arch.block_idx()
-    block_dim, _, _ = cute.arch.block_dim()
-    idx = block_idx * block_dim + thread_idx
-    m, n = gA.shape[1]
+@cute.jit
+def zdiv_demo(mA: cute.Tensor):
+    gA = cute.zipped_divide(mA, (1, 4))
+    print("Tiled tensor gA:", gA)
+
+    mi = cutlass.Int32(0)
+    ni = cutlass.Int32(0)
+    tile = gA[(None, (mi, ni))]
+    print("Per-thread tile slice:", tile)
+
+    frag = cute.make_fragment(tile.layout, tile.element_type)
+    frag.store(tile.load())
+    cute.print_tensor(frag)
 
 
 if __name__ == "__main__":
