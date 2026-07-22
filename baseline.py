@@ -2,7 +2,7 @@ import time
 import numpy as np
 
 
-n = 1024
+n = 4096
 a = np.full((n, n), 2.)
 b = np.full((n, n), 3.)
 c = np.full((n, n), 0.1)
