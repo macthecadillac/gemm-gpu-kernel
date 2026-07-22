@@ -1,7 +1,7 @@
 use std::time::Instant;
 use rayon::prelude::*;
 
-const TILESIZE: usize = 4096;
+const TILESIZE: usize = 64;
 
 #[derive(Debug)]
 struct Matrix {
@@ -20,13 +20,14 @@ impl Matrix {
     ) -> MatrixIndex {
         assert!(i_end <= self.nrow);
         assert!(j_end <= self.ncol);
-        let m = self.nrow;
-        let n = self.ncol;
+        let m = i_end - i_start;
+        let n = j_end - j_start;
         MatrixIndex { m, n, i_start, i_end, j_start, j_end }
     }
 }
 
 #[derive(Copy, Clone)]
+#[allow(dead_code)]
 struct MatrixIndex {
     m: usize,
     n: usize,
@@ -69,6 +70,33 @@ impl MatrixIndex {
     }
 }
 
+fn kernel<'a>(
+    ai: MatrixIndex,
+    bi: MatrixIndex,
+    ci: MatrixIndex,
+    a: &'a Matrix,
+    b: &'a Matrix,
+    c: &'a mut Matrix,
+    alpha: f64,
+) {
+    let m = ai.i_end - ai.i_start;
+    let l = ai.j_end - ai.j_start;
+    let n = bi.j_end - bi.j_start;
+    for i in 0..m {
+        let a_start = (ai.i_start + i) * ai.n + ai.j_start;
+        let c_start = (ci.i_start + i) * ci.n + ci.j_start;
+        let c_row = &mut c.data[c_start..c_start + n];
+        for k in 0..l {
+            let a_ik = alpha * a.data[a_start + k];
+            let b_start = (bi.i_start + k) * bi.n + bi.j_start;
+            let b_row = &b.data[b_start..b_start + n];
+            for (c_ij, &b_kj) in c_row.iter_mut().zip(b_row) {
+                *c_ij += a_ik * b_kj;
+            }
+        }
+    };
+}
+
 fn gemm_divide_and_conquer<'a>(
     ai: MatrixIndex,
     bi: MatrixIndex,
@@ -79,67 +107,25 @@ fn gemm_divide_and_conquer<'a>(
     alpha: f64,
     beta: f64
 ) {
-    if ci.i_end - ci.i_start > TILESIZE && ci.j_end - ci.j_start > TILESIZE {
+    let m = ci.i_end - ci.i_start;
+    let l = ai.i_end - ai.i_start;
+    let n = ci.j_end - ci.j_start;
+    if m < TILESIZE || n < TILESIZE || l < TILESIZE {
         let [a00, a01, a10, a11] = ai.quadrants();
         let [b00, b01, b10, b11] = bi.quadrants();
         let [c00, c01, c10, c11] = ci.quadrants();
 
         gemm_divide_and_conquer(a00, b00, c00, a, b, c, alpha, beta);
-        gemm_divide_and_conquer(a10, b00, c10, a, b, c, alpha, beta);
-        gemm_divide_and_conquer(a00, b01, c01, a, b, c, alpha, beta);
-        gemm_divide_and_conquer(a10, b01, c11, a, b, c, alpha, beta);
         gemm_divide_and_conquer(a01, b10, c00, a, b, c, alpha, beta);
         gemm_divide_and_conquer(a11, b10, c10, a, b, c, alpha, beta);
+        gemm_divide_and_conquer(a10, b00, c10, a, b, c, alpha, beta);
         gemm_divide_and_conquer(a01, b11, c01, a, b, c, alpha, beta);
+        gemm_divide_and_conquer(a00, b01, c01, a, b, c, alpha, beta);
+        gemm_divide_and_conquer(a10, b01, c11, a, b, c, alpha, beta);
         gemm_divide_and_conquer(a11, b11, c11, a, b, c, alpha, beta);
+    } else {
+        kernel(ai, bi, ci, a, b, c, alpha);
     }
-    let mut a_tile = Vec::new();
-    let mut b_tile = Vec::new();
-    let mut c_tile = Vec::new();
-    a_tile.reserve_exact((ai.i_end - ai.i_start) * (ai.j_end - ai.j_start));
-    b_tile.reserve_exact((bi.i_end - bi.i_start) * (bi.j_end - bi.j_start));
-    c_tile.reserve_exact((ci.i_end - ci.i_start) * (ci.j_end - ci.j_start));
-
-    // pack a in row-major
-    for i in ai.i_start..ai.i_end {
-        for j in ai.j_start..ai.j_end {
-            a_tile.push(a.data[ai.n * i + j]);
-        }
-    }
-
-    // pack b in col-major
-    for j in bi.j_start..bi.j_end {
-        for i in bi.i_start..bi.i_end {
-            b_tile.push(b.data[bi.n * i + j]);
-        }
-    }
-
-    // pack c in row-major
-    for i in ci.i_start..ci.i_end {
-        for j in ci.j_start..ci.j_end {
-            c_tile.push(c.data[ci.n * i + j]);
-        }
-    }
-
-    // tile-based gemm
-    let a_m = ai.i_end - ai.i_start;
-    let a_n = ai.j_end - ai.j_start;
-    let b_m = bi.i_end - bi.i_start;
-    let b_n = bi.j_end - bi.j_start;
-    let c_m = ci.i_end - ci.i_start;
-    let c_n = ci.j_end - ci.j_start;
-    c_tile.par_iter_mut()
-        .enumerate()
-        .for_each(|(k, c_ij)| {
-            let i = k / c_n;
-            let j = k % c_n;
-            let a_row_i = &a_tile[i * a_n..(i + 1) * a_n];
-            let b_col_j = &b_tile[j * b_m..(j + 1) * b_m];
-            *c_ij += alpha * a_row_i.iter()
-                .zip(b_col_j.iter())
-                .map(|(&x, &y)| x * y)
-                .sum::<f64>();
-        });
 }
 
 /// GEMM takes three matrix arguments--A, B, C and computes
@@ -160,11 +146,14 @@ fn gemm<'a>(
     let ai = a.index(0, a.nrow, 0, a.ncol);
     let bi = b.index(0, b.nrow, 0, b.ncol);
     let ci = c.index(0, b.nrow, 0, b.ncol);
+    for c_i in c.data.iter_mut() {
+        *c_i *= beta;
+    }
     gemm_divide_and_conquer(ai, bi, ci, a, b, c, alpha, beta);
 }
 
 fn main() {
-    let n = 4096;
+    let n = 1024;
     let a = Matrix { nrow: n, ncol: n, data: vec![2.; n * n] };
     let b = Matrix { nrow: n, ncol: n, data: vec![3.; n * n] };
     let mut c = Matrix { nrow: n, ncol: n, data: vec![0.1; n * n] };
@@ -174,5 +163,6 @@ fn main() {
     let start_time = Instant::now();
     gemm(&a, &b, &mut c, alpha, beta);
     let end_time = Instant::now();
+    assert!(c.data.iter().all(|x| (x - 6144.1).abs() < 1e-8));
     println!("{:?}", end_time - start_time);
 }
