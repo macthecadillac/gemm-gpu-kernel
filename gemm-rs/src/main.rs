@@ -132,7 +132,7 @@ fn kernel<'a>(
                 // store c tile
                 for m in 0..4 {
                     for n in 0..4 {
-                        c_rows[m][n] = c_tile[m][n];
+                        c_rows[m][z + n] = c_tile[m][n];
                     }
                 }
             }
@@ -152,7 +152,7 @@ fn gemm_divide_and_conquer<'a>(
     let m = ci.i_end - ci.i_start;
     let l = bi.i_end - bi.i_start;
     let n = ci.j_end - ci.j_start;
-    if m < TILESIZE || n < TILESIZE || l < TILESIZE {
+    if m <= TILESIZE || n <= TILESIZE || l <= TILESIZE {
         kernel(ai, bi, ci, a, b, c, alpha);
     } else {
         let [a00, a01, a10, a11] = ai.quadrants();
