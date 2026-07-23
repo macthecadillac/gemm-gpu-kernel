@@ -6,11 +6,6 @@ const TILESIZE: usize = 256;
 const MR: usize = 4;
 const NR: usize = 8;
 
-struct Buffer<'a> {
-    a_panel: &'a mut [f64],
-    b_panel: &'a mut [f64]
-}
-
 #[derive(Debug)]
 struct Matrix {
     m: usize,
@@ -62,41 +57,43 @@ fn microkernel(
 }
 
 #[inline]
-fn kernel<'a>(
+fn kernel(
     ai: Strides,
     bi: Strides,
-    ci: Strides,
-    a: &'a Matrix,
-    c: &'a mut Matrix,
+    bn: usize,
+    // ci: Strides,
+    a: &Matrix,
+    // c: &mut Matrix,
+    c_macro_tile: &mut [f64],
     alpha: f64,
-    buffer: &'a mut Buffer
+    a_panel: &mut [f64],  // uninitialized scratch space
+    b_panel: &[f64]       // panel already filled out
 ) {
     let m = ai.i_end - ai.i_start;
     let l = ai.j_end - ai.j_start;
     let n = bi.j_end - bi.j_start;
 
-    // set up buffers
-    let a_panel = &mut buffer.a_panel[0..l * MR];
-    let b_panel = &mut buffer.b_panel[0..l * n];
-    // pack_b(n, l, bi, b, b_panel);
+    // set up buffer
+    let a_panel = &mut a_panel[0..l * MR];
 
     // this one lives in the registers
     let mut c_tile = [[0.; NR]; MR];
 
     for i in (0..m).step_by(MR) {
         let a_start = (ai.i_start + i) * a.n + ai.j_start;
-        let c_start = (ci.i_start + i) * c.n + ci.j_start;
+        // let c_start = (ci.i_start + i) * c.n + ci.j_start;
 
         // set up c rows
         // initialize array to hold range information about the rows
         let mut range_slice: [_; MR] = array::from_fn(|_| 0..1);
         // fill the range array with actually ranges of the rows
         for (idx, range) in (0..MR)
-            .map(|row| c_start + row * c.n..c_start + n + row * c.n)
+            .map(|row| row * bn..row * bn + n)
             .enumerate() {
             range_slice[idx] = range;
         }
-        let mut c_rows = c.data.get_disjoint_mut(range_slice).unwrap();
+        let mut c_rows = c_macro_tile.get_disjoint_mut(range_slice)
+                                     .unwrap();
 
         // pack one micro-panel of A
         for k in 0..l {
@@ -111,12 +108,14 @@ fn kernel<'a>(
     };
 }
 
-fn gemm_divide_and_conquer<'a>(
-    a: &'a Matrix,
-    b: &'a Matrix,
-    c: &'a mut Matrix,
+/// Break the problem into blocks and work on the blocks individually
+fn gemm_blocked(
+    a: &Matrix,
+    b: &Matrix,
+    c: &mut Matrix,
     alpha: f64,
-    buffer: &'a mut Buffer,
+    a_buffer: &mut [f64],
+    b_buffer: &mut [f64]
 ) {
     let mtile = a.m / TILESIZE;
     let ntile = b.n / TILESIZE;
@@ -131,17 +130,35 @@ fn gemm_divide_and_conquer<'a>(
             };
             let n = bi.j_end - bi.j_start;
             let l = bi.i_end - bi.i_start;
-            let b_panel = &mut buffer.b_panel[0..TILESIZE * TILESIZE];
+            let b_panel = &mut b_buffer[0..TILESIZE * TILESIZE];
             // pack the entire tile into b_panel with a swizzling pattern 
             // across many micro-panels
             let mut mpr = 0;  // micro-panel row
             for j in (0..n).step_by(NR) {
                 for k in 0..l {
                     let row_start = (bi.i_start + k) * b.n + bi.j_start + j;
-                    b_panel[mpr * NR..mpr * NR + NR].clone_from_slice(&b.data[row_start..row_start + NR]);
+                    b_panel[mpr * NR..mpr * NR + NR].clone_from_slice(
+                        &b.data[row_start..row_start + NR]
+                    );
                     mpr += 1;
                 }
             }
+
+            // break c into pieces to be distributed across threads
+            let mut c_tiles = Vec::with_capacity(mtile);
+            let [tile, mut c_rest] = c.data
+                .get_disjoint_mut([0..TILESIZE, TILESIZE..a.m])
+                .unwrap();
+            c_tiles.push(tile);
+            for ii in (0..mtile).map(|i| i * TILESIZE) {
+                let [tile, rest] = c_rest
+                    .get_disjoint_mut([ii..ii + TILESIZE,
+                                       ii + TILESIZE..a.m])
+                    .unwrap();
+                c_tiles.push(tile);
+                c_rest = rest;
+            }
+
             for ii in (0..mtile).map(|i| i * TILESIZE) {
                 let ai = Strides {
                     i_start: ii,
@@ -149,13 +166,15 @@ fn gemm_divide_and_conquer<'a>(
                     j_start: kk,
                     j_end: kk + TILESIZE
                 };
-                let ci = Strides {
-                    i_start: ii,
-                    i_end: ii + TILESIZE,
-                    j_start: jj,
-                    j_end: jj + TILESIZE
-                };
-                kernel(ai, bi, ci, a, c, alpha, buffer);
+                // let ci = Strides {
+                //     i_start: ii,
+                //     i_end: ii + TILESIZE,
+                //     j_start: jj,
+                //     j_end: jj + TILESIZE
+                // };
+                // kernel(ai, bi, ci, a, c, alpha, a_buffer, b_panel);
+                kernel(ai, bi, TILESIZE, a, c_tiles[ii], alpha, a_buffer,
+                       b_panel);
             }
         }
     }
@@ -163,15 +182,9 @@ fn gemm_divide_and_conquer<'a>(
 
 /// GEMM takes three matrix arguments--A, B, C and computes
 /// X = A B + C
-/// Naive divide-and-conquer algorithm. O(n^3)
+/// Blocking algorithm. O(n^3)
 /// Assume row-major
-fn gemm<'a>(
-    a: &'a Matrix,
-    b: &'a Matrix,
-    c: &'a mut Matrix,
-    alpha: f64,
-    beta: f64
-) {
+fn gemm( a: &Matrix, b: &Matrix, c: &mut Matrix, alpha: f64, beta: f64) {
     // assure we are getting proper dimensions for GEMM
     assert_eq!(c.m, a.m);
     assert_eq!(c.n, b.n);
@@ -186,17 +199,17 @@ fn gemm<'a>(
         *c_i *= beta;
     }
 
-    let mut a_panel = [0.; TILESIZE * MR];
-    let mut b_panel = [0.; TILESIZE * TILESIZE];
-    let mut buffer = Buffer { a_panel: &mut a_panel, b_panel: &mut b_panel };
-
-    gemm_divide_and_conquer(a, b, c, alpha, &mut buffer);
+    let mut a_buffer = [0.; TILESIZE * MR];
+    let mut b_buffer = [0.; TILESIZE * TILESIZE];
+    gemm_blocked(a, b, c, alpha, &mut a_buffer, &mut b_buffer);
 }
 
 fn main() {
     let n = 4096;
     let a_data = (0..4096 * 4096).map(|x| x as f64 / (2048. * 2048.)).collect();
-    let b_data = (0..4096 * 4096).rev().map(|x| x as f64 / (2048. * 2048.) - 0.5).collect();
+    let b_data = (0..4096 * 4096).rev()
+                                 .map(|x| x as f64 / (2048. * 2048.) - 0.5)
+                                 .collect();
     let a = Matrix { m: n, n, data: a_data };
     let b = Matrix { m: n, n, data: b_data };
     let mut c = Matrix { m: n, n, data: vec![0.1; n * n] };
