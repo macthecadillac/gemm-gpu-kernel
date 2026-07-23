@@ -1,5 +1,4 @@
 use std::array;
-use std::ops::Range;
 use std::time::Instant;
 // use rayon::prelude::*;
 
@@ -88,10 +87,12 @@ fn microkernel(
     c_rows: &mut [&mut [f64]],
     c_tile: &mut [[f64; NR]]
 ) {
+    // load c tile
     for row in 0..MR {
         c_tile[row].copy_from_slice(&c_rows[row][j..j + NR]);
     }
 
+    // actual matrix multiplication
     let panel_start = (j / NR) * l * NR;
     for k in 0..l {
         let b_start = panel_start + k * NR;
@@ -132,28 +133,8 @@ fn kernel<'a>(
     // this one lives in the registers
     let mut c_tile = [[0.; NR]; MR];
 
-    // 2. Avoid repeatedly packing the same B block
-    //
-    // A particular (K,N) B leaf is currently repacked once for each of the
-    // 16 M blocks. A more BLAS-like outer schedule is:
-    //
-    // for K block
-    //   for N block
-    //       pack B once
-    //       parallelize over M blocks
-    //           pack A panel
-    //           run microkernel
-    //
-    // That both reuses packed B and provides a natural parallelization 
-    // boundary: different M blocks update disjoint C rows while sharing 
-    // immutable packed B.
-    //
-    // This requires moving some scheduling responsibility out of the current 
-    // recursive leaf structure, so I would combine it with the 
-    // parallelization work rather than contort the recursion around a packed-
-    // panel cache.
-
-    // b_panel is packed in a swizzle pattern
+    // pack the entire tile into b_panel with a swizzling pattern across
+    // many micro-panels
     let mut mpr = 0;  // micro-panel row
     for j in (0..n).step_by(NR) {
         for k in 0..l {
@@ -169,7 +150,7 @@ fn kernel<'a>(
 
         // set up c rows
         // initialize array to hold range information about the rows
-        let mut range_slice: [Range<usize>; MR] = array::from_fn(|_| 0..1);
+        let mut range_slice: [_; MR] = array::from_fn(|_| 0..1);
         // fill the range array with actually ranges of the rows
         for (idx, range) in (0..MR)
             .map(|row| c_start + row * ci.n..c_start + n + row * ci.n)
@@ -178,7 +159,7 @@ fn kernel<'a>(
         }
         let mut c_rows = c.data.get_disjoint_mut(range_slice).unwrap();
 
-        // Pack A as K-major groups of MR rows and apply alpha once.
+        // pack one micro-panel of A
         for k in 0..l {
             for row in 0..MR {
                 a_panel[k * MR + row] = alpha * a.data[a_start + k + row * ai.n];
@@ -233,9 +214,15 @@ fn gemm<'a>(
     alpha: f64,
     beta: f64
 ) {
+    // assure we are getting proper dimensions for GEMM
     assert_eq!(c.nrow, a.nrow);
     assert_eq!(c.ncol, b.ncol);
     assert_eq!(a.ncol, b.nrow);
+
+    // work with square matrices for now
+    assert_eq!(a.nrow, a.ncol);
+    assert_eq!(b.nrow, b.ncol);
+    assert_eq!(c.nrow, c.ncol);
 
     let ai = a.index(0, a.nrow, 0, a.ncol);
     let bi = b.index(0, b.nrow, 0, b.ncol);
@@ -244,7 +231,7 @@ fn gemm<'a>(
         *c_i *= beta;
     }
 
-    let mut a_panel = [0.; TILESIZE * NR];
+    let mut a_panel = [0.; TILESIZE * MR];
     let mut b_panel = [0.; TILESIZE * TILESIZE];
     let mut buffer = Buffer { a_panel: &mut a_panel, b_panel: &mut b_panel };
 
