@@ -80,6 +80,38 @@ impl Strides {
 }
 
 #[inline]
+fn microkernel(
+    l: usize,
+    j: usize,
+    a_panel: &[f64],
+    b_panel: &[f64],
+    c_rows: &mut [&mut [f64]],
+    c_tile: &mut [[f64; NR]]
+) {
+    for row in 0..MR {
+        c_tile[row].copy_from_slice(&c_rows[row][j..j + NR]);
+    }
+
+    let panel_start = (j / NR) * l * NR;
+    for k in 0..l {
+        let b_start = panel_start + k * NR;
+        let b_row = &b_panel[b_start..b_start + NR];
+
+        for row in 0..MR {
+            for col in 0..NR {
+                c_tile[row][col] =
+                    a_panel[k * MR + row].mul_add(b_row[col], c_tile[row][col]);
+            }
+        }
+    }
+
+    // store c tile
+    for row in 0..MR {
+        c_rows[row][j..j + NR].copy_from_slice(&c_tile[row]);
+    }
+}
+
+#[inline]
 fn kernel<'a>(
     ai: Strides,
     bi: Strides,
@@ -99,6 +131,27 @@ fn kernel<'a>(
     let b_panel = &mut buffer.b_panel[0..l * n];
     // this one lives in the registers
     let mut c_tile = [[0.; NR]; MR];
+
+    // 2. Avoid repeatedly packing the same B block
+    //
+    // A particular (K,N) B leaf is currently repacked once for each of the
+    // 16 M blocks. A more BLAS-like outer schedule is:
+    //
+    // for K block
+    //   for N block
+    //       pack B once
+    //       parallelize over M blocks
+    //           pack A panel
+    //           run microkernel
+    //
+    // That both reuses packed B and provides a natural parallelization 
+    // boundary: different M blocks update disjoint C rows while sharing 
+    // immutable packed B.
+    //
+    // This requires moving some scheduling responsibility out of the current 
+    // recursive leaf structure, so I would combine it with the 
+    // parallelization work rather than contort the recursion around a packed-
+    // panel cache.
 
     // b_panel is packed in a swizzle pattern
     let mut mpr = 0;  // micro-panel row
@@ -123,7 +176,7 @@ fn kernel<'a>(
             .enumerate() {
             range_slice[idx] = range;
         }
-        let c_rows = c.data.get_disjoint_mut(range_slice).unwrap();
+        let mut c_rows = c.data.get_disjoint_mut(range_slice).unwrap();
 
         // Pack A as K-major groups of MR rows and apply alpha once.
         for k in 0..l {
@@ -133,26 +186,7 @@ fn kernel<'a>(
         }
 
         for j in (0..n).step_by(NR) {
-            for row in 0..MR {
-                c_tile[row].copy_from_slice(&c_rows[row][j..j + NR]);
-            }
-
-            let panel_start = (j / NR) * l * NR;
-            for k in 0..l {
-                let b_start = panel_start + k * NR;
-                let b_row = &b_panel[b_start..b_start + NR];
-
-                for row in 0..MR {
-                    for col in 0..NR {
-                        c_tile[row][col] =
-                            a_panel[k * MR + row].mul_add(b_row[col], c_tile[row][col]);
-                    }
-                }
-            }
-            // store c tile
-            for row in 0..MR {
-                c_rows[row][j..j + NR].copy_from_slice(&c_tile[row]);
-            }
+            microkernel(l, j, a_panel, b_panel, &mut c_rows[..], &mut c_tile);
         }
     };
 }
