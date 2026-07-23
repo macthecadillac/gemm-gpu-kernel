@@ -60,10 +60,9 @@ fn microkernel(
 fn kernel(
     ai: Strides,
     bi: Strides,
-    bn: usize,
-    // ci: Strides,
+    c_col_start: usize,
+    c_stride: usize,
     a: &Matrix,
-    // c: &mut Matrix,
     c_macro_tile: &mut [f64],
     alpha: f64,
     a_panel: &mut [f64],  // uninitialized scratch space
@@ -81,17 +80,12 @@ fn kernel(
 
     for i in (0..m).step_by(MR) {
         let a_start = (ai.i_start + i) * a.n + ai.j_start;
-        // let c_start = (ci.i_start + i) * c.n + ci.j_start;
 
         // set up c rows
-        // initialize array to hold range information about the rows
-        let mut range_slice: [_; MR] = array::from_fn(|_| 0..1);
-        // fill the range array with actually ranges of the rows
-        for (idx, range) in (0..MR)
-            .map(|row| row * bn..row * bn + n)
-            .enumerate() {
-            range_slice[idx] = range;
-        }
+        let range_slice: [_; MR] = array::from_fn(|row| {
+            let start = (i + row) * c_stride + c_col_start;
+            start..start + n
+        });
         let mut c_rows = c_macro_tile.get_disjoint_mut(range_slice)
                                      .unwrap();
 
@@ -117,7 +111,6 @@ fn gemm_blocked(
     a_buffer: &mut [f64],
     b_buffer: &mut [f64]
 ) {
-    let mtile = a.m / TILESIZE;
     let ntile = b.n / TILESIZE;
     let ltile = b.m / TILESIZE;
     for kk in (0..ltile).map(|k| k * TILESIZE) {
@@ -144,37 +137,31 @@ fn gemm_blocked(
                 }
             }
 
-            // break c into pieces to be distributed across threads
-            let mut c_tiles = Vec::with_capacity(mtile);
-            let [tile, mut c_rest] = c.data
-                .get_disjoint_mut([0..TILESIZE, TILESIZE..a.m])
-                .unwrap();
-            c_tiles.push(tile);
-            for ii in (0..mtile).map(|i| i * TILESIZE) {
-                let [tile, rest] = c_rest
-                    .get_disjoint_mut([ii..ii + TILESIZE,
-                                       ii + TILESIZE..a.m])
-                    .unwrap();
-                c_tiles.push(tile);
-                c_rest = rest;
-            }
-
-            for ii in (0..mtile).map(|i| i * TILESIZE) {
+            // Split C into disjoint slabs of complete rows. Each slab retains
+            // the original matrix row stride; jj selects the active columns.
+            let c_stride = c.n;
+            let c_macro_len = TILESIZE * c_stride;
+            for (block_idx, c_macro_tile) in c.data
+                .chunks_exact_mut(c_macro_len)
+                .enumerate() {
+                let ii = block_idx * TILESIZE;
                 let ai = Strides {
                     i_start: ii,
                     i_end: ii + TILESIZE,
                     j_start: kk,
                     j_end: kk + TILESIZE
                 };
-                // let ci = Strides {
-                //     i_start: ii,
-                //     i_end: ii + TILESIZE,
-                //     j_start: jj,
-                //     j_end: jj + TILESIZE
-                // };
-                // kernel(ai, bi, ci, a, c, alpha, a_buffer, b_panel);
-                kernel(ai, bi, TILESIZE, a, c_tiles[ii], alpha, a_buffer,
-                       b_panel);
+                kernel(
+                    ai,
+                    bi,
+                    jj,
+                    c_stride,
+                    a,
+                    c_macro_tile,
+                    alpha,
+                    a_buffer,
+                    b_panel,
+                );
             }
         }
     }
