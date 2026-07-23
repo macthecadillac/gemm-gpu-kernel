@@ -1,6 +1,6 @@
 use std::array;
 use std::time::Instant;
-// use rayon::prelude::*;
+use rayon::prelude::*;
 
 const TILESIZE: usize = 256;
 const MR: usize = 4;
@@ -108,7 +108,6 @@ fn gemm_blocked(
     b: &Matrix,
     c: &mut Matrix,
     alpha: f64,
-    a_buffer: &mut [f64],
     b_buffer: &mut [f64]
 ) {
     let ntile = b.n / TILESIZE;
@@ -141,9 +140,9 @@ fn gemm_blocked(
             // the original matrix row stride; jj selects the active columns.
             let c_stride = c.n;
             let c_macro_len = TILESIZE * c_stride;
-            for (block_idx, c_macro_tile) in c.data
-                .chunks_exact_mut(c_macro_len)
-                .enumerate() {
+            c.data.par_chunks_exact_mut(c_macro_len)
+                  .enumerate()
+                  .for_each(|(block_idx, c_macro_tile)| {
                 let ii = block_idx * TILESIZE;
                 let ai = Strides {
                     i_start: ii,
@@ -151,18 +150,10 @@ fn gemm_blocked(
                     j_start: kk,
                     j_end: kk + TILESIZE
                 };
-                kernel(
-                    ai,
-                    bi,
-                    jj,
-                    c_stride,
-                    a,
-                    c_macro_tile,
-                    alpha,
-                    a_buffer,
-                    b_panel,
-                );
-            }
+                let mut a_buffer = [0.; TILESIZE * MR];
+                kernel(ai, bi, jj, c_stride, a, c_macro_tile, alpha,
+                       &mut a_buffer, b_panel);
+            });
         }
     }
 }
@@ -186,9 +177,8 @@ fn gemm( a: &Matrix, b: &Matrix, c: &mut Matrix, alpha: f64, beta: f64) {
         *c_i *= beta;
     }
 
-    let mut a_buffer = [0.; TILESIZE * MR];
     let mut b_buffer = [0.; TILESIZE * TILESIZE];
-    gemm_blocked(a, b, c, alpha, &mut a_buffer, &mut b_buffer);
+    gemm_blocked(a, b, c, alpha, &mut b_buffer);
 }
 
 fn main() {
