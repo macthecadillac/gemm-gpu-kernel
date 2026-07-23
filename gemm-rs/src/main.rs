@@ -1,7 +1,7 @@
 use std::time::Instant;
 use rayon::prelude::*;
 
-const TILESIZE: usize = 128;
+const TILESIZE: usize = 256;
 
 #[derive(Debug)]
 struct Matrix {
@@ -112,27 +112,28 @@ fn kernel<'a>(
             let b_rows = [b_row1, b_row2, b_row3, b_row4];
 
             let row_length = c_rows[0].len();
-            for z in (0..row_length).step_by(4) {
+            for j in (0..row_length).step_by(4) {
                 // load b and c tiles
                 for m in 0..4 {
                     for n in 0..4 {
-                        b_tile[m][n] = b_rows[m][z..z + 4][n];
-                        c_tile[m][n] = c_rows[m][z..z + 4][n];
+                        b_tile[m][n] = b_rows[m][j..j + 4][n];
+                        c_tile[m][n] = c_rows[m][j..j + 4][n];
                     }
                 }
 
-                for m in 0..4 {
-                    for n in 0..4 {
-                        for l in 0..4 {
-                            c_tile[m][n] = a_tile[m][l].mul_add(b_tile[l][n], c_tile[m][n]);
-                        }
+                for l in 0..4 {
+                    for m in 0..4 {
+                        c_tile[m][0] = a_tile[m][l].mul_add(b_tile[l][0], c_tile[m][0]);
+                        c_tile[m][1] = a_tile[m][l].mul_add(b_tile[l][1], c_tile[m][1]);
+                        c_tile[m][2] = a_tile[m][l].mul_add(b_tile[l][2], c_tile[m][2]);
+                        c_tile[m][3] = a_tile[m][l].mul_add(b_tile[l][3], c_tile[m][3]);
                     }
                 }
 
                 // store c tile
                 for m in 0..4 {
                     for n in 0..4 {
-                        c_rows[m][z + n] = c_tile[m][n];
+                        c_rows[m][j + n] = c_tile[m][n];
                     }
                 }
             }
