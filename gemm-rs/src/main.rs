@@ -1,11 +1,16 @@
 use std::array;
 use std::ops::Range;
 use std::time::Instant;
-use rayon::prelude::*;
+// use rayon::prelude::*;
 
 const TILESIZE: usize = 256;
 const MR: usize = 4;
 const NR: usize = 8;
+
+struct Buffer<'a> {
+    a_panel: &'a mut [f64],
+    b_panel: &'a mut [f64]
+}
 
 #[derive(Debug)]
 struct Matrix {
@@ -83,21 +88,28 @@ fn kernel<'a>(
     b: &'a Matrix,
     c: &'a mut Matrix,
     alpha: f64,
+    buffer: &'a mut Buffer
 ) {
     let m = ai.i_end - ai.i_start;
     let l = ai.j_end - ai.j_start;
     let n = bi.j_end - bi.j_start;
 
+    // set up buffers
+    let a_panel = &mut buffer.a_panel[0..l * MR];
+    let b_panel = &mut buffer.b_panel[0..l * n];
+    // this one lives in the registers
+    let mut c_tile = [[0.; NR]; MR];
+
     // b_panel is packed in a swizzle pattern
-    let mut b_panel = Vec::with_capacity(l * n);
+    let mut mpr = 0;  // micro-panel row
     for j in (0..n).step_by(NR) {
         for k in 0..l {
             let row_start = (bi.i_start + k) * bi.n + bi.j_start + j;
-            b_panel.extend_from_slice(&b.data[row_start..row_start + NR]);
+            b_panel[mpr * NR..mpr * NR + NR].clone_from_slice(&b.data[row_start..row_start + NR]);
+            mpr += 1;
         }
     }
 
-    let mut a_panel = vec![0.; l * MR];
     for i in (0..m).step_by(MR) {
         let a_start = (ai.i_start + i) * ai.n + ai.j_start;
         let c_start = (ci.i_start + i) * ci.n + ci.j_start;
@@ -121,7 +133,6 @@ fn kernel<'a>(
         }
 
         for j in (0..n).step_by(NR) {
-            let mut c_tile = [[0.; NR]; MR];
             for row in 0..MR {
                 c_tile[row].copy_from_slice(&c_rows[row][j..j + NR]);
             }
@@ -154,25 +165,26 @@ fn gemm_divide_and_conquer<'a>(
     b: &'a Matrix,
     c: &'a mut Matrix,
     alpha: f64,
+    buffer: &'a mut Buffer,
 ) {
     let m = ci.i_end - ci.i_start;
     let l = bi.i_end - bi.i_start;
     let n = ci.j_end - ci.j_start;
     if m <= TILESIZE || n <= TILESIZE || l <= TILESIZE {
-        kernel(ai, bi, ci, a, b, c, alpha);
+        kernel(ai, bi, ci, a, b, c, alpha, buffer);
     } else {
         let [a00, a01, a10, a11] = ai.quadrants();
         let [b00, b01, b10, b11] = bi.quadrants();
         let [c00, c01, c10, c11] = ci.quadrants();
 
-        gemm_divide_and_conquer(a00, b00, c00, a, b, c, alpha);
-        gemm_divide_and_conquer(a01, b10, c00, a, b, c, alpha);
-        gemm_divide_and_conquer(a11, b10, c10, a, b, c, alpha);
-        gemm_divide_and_conquer(a10, b00, c10, a, b, c, alpha);
-        gemm_divide_and_conquer(a01, b11, c01, a, b, c, alpha);
-        gemm_divide_and_conquer(a00, b01, c01, a, b, c, alpha);
-        gemm_divide_and_conquer(a10, b01, c11, a, b, c, alpha);
-        gemm_divide_and_conquer(a11, b11, c11, a, b, c, alpha);
+        gemm_divide_and_conquer(a00, b00, c00, a, b, c, alpha, buffer);
+        gemm_divide_and_conquer(a01, b10, c00, a, b, c, alpha, buffer);
+        gemm_divide_and_conquer(a11, b10, c10, a, b, c, alpha, buffer);
+        gemm_divide_and_conquer(a10, b00, c10, a, b, c, alpha, buffer);
+        gemm_divide_and_conquer(a01, b11, c01, a, b, c, alpha, buffer);
+        gemm_divide_and_conquer(a00, b01, c01, a, b, c, alpha, buffer);
+        gemm_divide_and_conquer(a10, b01, c11, a, b, c, alpha, buffer);
+        gemm_divide_and_conquer(a11, b11, c11, a, b, c, alpha, buffer);
     }
 }
 
@@ -197,7 +209,12 @@ fn gemm<'a>(
     for c_i in c.data.iter_mut() {
         *c_i *= beta;
     }
-    gemm_divide_and_conquer(ai, bi, ci, a, b, c, alpha);
+
+    let mut a_panel = [0.; TILESIZE * NR];
+    let mut b_panel = [0.; TILESIZE * TILESIZE];
+    let mut buffer = Buffer { a_panel: &mut a_panel, b_panel: &mut b_panel };
+
+    gemm_divide_and_conquer(ai, bi, ci, a, b, c, alpha, &mut buffer);
 }
 
 fn main() {
