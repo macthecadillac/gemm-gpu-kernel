@@ -1,7 +1,11 @@
+use std::array;
+use std::ops::Range;
 use std::time::Instant;
 use rayon::prelude::*;
 
 const TILESIZE: usize = 256;
+const MR: usize = 4;
+const NR: usize = 8;
 
 #[derive(Debug)]
 struct Matrix {
@@ -83,59 +87,60 @@ fn kernel<'a>(
     let m = ai.i_end - ai.i_start;
     let l = ai.j_end - ai.j_start;
     let n = bi.j_end - bi.j_start;
-    let mut a_tile = [[0.; 4]; 4];
-    let mut b_tile = [[0.; 4]; 4];
-    let mut c_tile = [[0.; 4]; 4];
-    for i in (0..m).step_by(4) {
+
+    // b_panel is packed in a swizzle pattern
+    let mut b_panel = Vec::with_capacity(l * n);
+    for j in (0..n).step_by(NR) {
+        for k in 0..l {
+            let row_start = (bi.i_start + k) * bi.n + bi.j_start + j;
+            b_panel.extend_from_slice(&b.data[row_start..row_start + NR]);
+        }
+    }
+
+    let mut a_panel = vec![0.; l * MR];
+    for i in (0..m).step_by(MR) {
         let a_start = (ai.i_start + i) * ai.n + ai.j_start;
         let c_start = (ci.i_start + i) * ci.n + ci.j_start;
-        let c_rows = c.data.get_disjoint_mut([
-            c_start..c_start + n,
-            c_start + ci.n..c_start + n + ci.n,
-            c_start + 2 * ci.n..c_start + n + 2 * ci.n,
-            c_start + 3 * ci.n..c_start + n + 3 * ci.n
-        ]).unwrap();
-        // register blocking 4x4
-        for k in (0..l).step_by(4) {
-            // load a_tile
-            for m in 0..4 {
-                for n in 0..4 {
-                    a_tile[m][n] = alpha * a.data[a_start + k + n + m * ai.n]
-                }
+
+        // set up c rows
+        // initialize array to hold range information about the rows
+        let mut range_slice: [Range<usize>; MR] = array::from_fn(|_| 0..1);
+        // fill the range array with actually ranges of the rows
+        for (idx, range) in (0..MR)
+            .map(|row| c_start + row * ci.n..c_start + n + row * ci.n)
+            .enumerate() {
+            range_slice[idx] = range;
+        }
+        let c_rows = c.data.get_disjoint_mut(range_slice).unwrap();
+
+        // Pack A as K-major groups of MR rows and apply alpha once.
+        for k in 0..l {
+            for row in 0..MR {
+                a_panel[k * MR + row] = alpha * a.data[a_start + k + row * ai.n];
+            }
+        }
+
+        for j in (0..n).step_by(NR) {
+            let mut c_tile = [[0.; NR]; MR];
+            for row in 0..MR {
+                c_tile[row].copy_from_slice(&c_rows[row][j..j + NR]);
             }
 
-            let b_start = (bi.i_start + k) * bi.n + bi.j_start;
-            let b_row1 = &b.data[b_start..b_start + n];
-            let b_row2 = &b.data[b_start + bi.n..b_start + n + bi.n];
-            let b_row3 = &b.data[b_start + 2 * bi.n..b_start + n + 2 * bi.n];
-            let b_row4 = &b.data[b_start + 3 * bi.n..b_start + n + 3 * bi.n];
-            let b_rows = [b_row1, b_row2, b_row3, b_row4];
+            let panel_start = (j / NR) * l * NR;
+            for k in 0..l {
+                let b_start = panel_start + k * NR;
+                let b_row = &b_panel[b_start..b_start + NR];
 
-            let row_length = c_rows[0].len();
-            for j in (0..row_length).step_by(4) {
-                // load b and c tiles
-                for m in 0..4 {
-                    for n in 0..4 {
-                        b_tile[m][n] = b_rows[m][j..j + 4][n];
-                        c_tile[m][n] = c_rows[m][j..j + 4][n];
+                for row in 0..MR {
+                    for col in 0..NR {
+                        c_tile[row][col] =
+                            a_panel[k * MR + row].mul_add(b_row[col], c_tile[row][col]);
                     }
                 }
-
-                for l in 0..4 {
-                    for m in 0..4 {
-                        c_tile[m][0] = a_tile[m][l].mul_add(b_tile[l][0], c_tile[m][0]);
-                        c_tile[m][1] = a_tile[m][l].mul_add(b_tile[l][1], c_tile[m][1]);
-                        c_tile[m][2] = a_tile[m][l].mul_add(b_tile[l][2], c_tile[m][2]);
-                        c_tile[m][3] = a_tile[m][l].mul_add(b_tile[l][3], c_tile[m][3]);
-                    }
-                }
-
-                // store c tile
-                for m in 0..4 {
-                    for n in 0..4 {
-                        c_rows[m][j + n] = c_tile[m][n];
-                    }
-                }
+            }
+            // store c tile
+            for row in 0..MR {
+                c_rows[row][j..j + NR].copy_from_slice(&c_tile[row]);
             }
         }
     };
